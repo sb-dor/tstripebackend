@@ -7,6 +7,15 @@
 <a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
 </p>
 
+## TStripe Backend
+
+This is the Laravel backend for the **tstripe** Flutter app. It handles Sanctum authentication, product catalogue, and Stripe cart checkout.
+
+> **Before diving into the code, read [`EXPLANATION.md`](EXPLANATION.md) first.**
+> It covers everything — why the backend exists, how Sanctum auth works, the idempotent checkout logic, webhook verification, and how all the pieces connect to the Flutter app.
+
+---
+
 ## About Laravel
 
 Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
