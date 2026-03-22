@@ -86,14 +86,136 @@ When you run `stripe listen --forward-to ...`, the CLI prints a `whsec_...` secr
 
 ---
 
-## 5. Database schema
+## 5. Sanctum authentication
 
-Two tables were created.
+Laravel Sanctum provides simple token-based API authentication. It was added to support user login and registration so that the products list and cart checkout are protected endpoints.
 
-### `orders` table
+### Installation
+
+```bash
+composer require laravel/sanctum
+php artisan install:api   # publishes Sanctum config + migration, adds HasApiTokens trait
+php artisan migrate
+```
+
+### `User` model changes
+
+`HasApiTokens` was added to the `User` model:
+
+```php
+use Laravel\Sanctum\HasApiTokens;
+
+class User extends Authenticatable {
+    use HasApiTokens, HasFactory, Notifiable;
+    protected $fillable = ['name', 'email', 'password'];
+}
+```
+
+`HasApiTokens` is what gives the user model the ability to create and revoke API tokens (`createToken`, `tokens()->delete()`).
+
+### `AuthController`
+
+Two public endpoints:
+
+**`POST /api/auth/register`** — creates a new account
+```
+Body: { "name": "Alex", "email": "alex@example.com", "password": "secret123", "password_confirmation": "secret123" }
+→ validates uniqueness of email
+→ hashes the password with Hash::make()
+→ creates user
+→ creates a Sanctum token
+→ returns { user: { id, name, email }, token }  (HTTP 201)
+```
+
+**`POST /api/auth/login`** — authenticates an existing account
+```
+Body: { "email": "alex@example.com", "password": "secret123" }
+→ finds user by email
+→ checks password with Hash::check()
+→ revokes all previous tokens (one active session per user)
+→ creates a fresh Sanctum token
+→ returns { user: { id, name, email }, token }  (HTTP 200)
+→ returns 401 if credentials are wrong
+```
+
+**`POST /api/auth/logout`** — protected, revokes the current token
+```
+Header: Authorization: Bearer <token>
+→ $request->user()->currentAccessToken()->delete()
+→ returns { message: "Logged out" }
+```
+
+### How Sanctum tokens work in API calls
+
+After login or register, the app receives a plain-text token. Every subsequent request to a protected endpoint must include:
+```
+Authorization: Bearer <token>
+```
+
+Protected routes are wrapped in `auth:sanctum` middleware:
+```php
+Route::middleware('auth:sanctum')->group(function () {
+    Route::post('/auth/logout',     [AuthController::class, 'logout']);
+    Route::get('/products',         [ProductController::class, 'index']);
+    Route::post('/orders/checkout', [OrderController::class, 'checkout']);
+});
+```
+
+If the token is missing or invalid, Laravel returns `401 Unauthenticated` automatically — no code needed.
+
+---
+
+## 5a. Products
+
+### Migration
+
+```
+id            — auto-incrementing primary key
+name          — product name
+description   — short description
+price         — decimal(8,2) — e.g. 9.99
+image_url     — nullable string
+created_at / updated_at
+```
+
+### `Product` model
+
+```php
+protected $fillable = ['name', 'description', 'price', 'image_url'];
+protected $casts    = ['price' => 'float'];
+```
+
+The `price` cast ensures the value comes out as a PHP float, not a string, when reading from the DB.
+
+### Seeder — 15 products
+
+```bash
+php artisan make:seeder ProductSeeder
+php artisan db:seed --class=ProductSeeder
+```
+
+15 electronics/accessories products with prices ranging from $4.99 to $99.99 are inserted. Run this once after migrating.
+
+### `ProductController`
+
+```php
+public function index(): JsonResponse
+{
+    return response()->json(Product::all());
+}
+```
+
+Protected by `auth:sanctum`. Returns the full products list as a JSON array. The Flutter app receives this and displays it in a grid.
+
+---
+
+## 5b. Database schema
+
+### `orders` table (extended)
 
 ```
 id                        — auto-incrementing primary key
+user_id                   — foreign key → users.id (nullable, nullOnDelete)
 amount                    — payment amount in cents (e.g. 999 = $9.99)
 currency                  — 3-letter currency code, default 'usd'
 status                    — 'pending' → 'paid' or 'failed'
@@ -102,10 +224,73 @@ stripe_client_secret      — the client_secret returned to the app
 created_at / updated_at   — Laravel auto-manages these timestamps
 ```
 
+`user_id` was added in a separate migration after the initial schema. It links every order to the authenticated user — required for the idempotent checkout logic (see section 5c).
+
+Why `nullOnDelete`? If a user account is deleted, their orders become anonymous rather than cascade-deleting — useful for keeping financial audit records.
+
 **Why store `stripe_payment_intent_id` and `stripe_client_secret` on the order?**
 
 - `stripe_payment_intent_id` is needed to look up the order when the webhook fires (`payment_intent.succeeded` tells you the `pi_xxx` ID, not the order ID — but we also pass `order_id` in metadata as a shortcut)
 - `stripe_client_secret` lets you retrieve the existing secret if the user retries a failed payment without creating a new PaymentIntent
+
+### 5c. Idempotent cart checkout — `OrderController`
+
+This is the most important piece of business logic in the backend. The problem it solves:
+
+> Every time the user taps "Checkout", should a new Order and PaymentIntent be created?
+
+**No.** Creating a new Order on every tap means a user who opens the payment sheet and cancels 5 times ends up with 5 stale `pending` orders in the database. Worse, each cancellation creates a new Stripe PaymentIntent that will just expire.
+
+The `OrderController::checkout` endpoint is idempotent — calling it multiple times with the same cart has the same effect as calling it once.
+
+**Logic flow:**
+
+```
+POST /api/orders/checkout
+Body: { "items": [{ "product_id": 1, "quantity": 2 }, ...] }
+
+1. Validate items — product_id must exist in products table, quantity >= 1
+
+2. Calculate total server-side
+   → load product prices from DB
+   → total = sum(price * quantity) in cents
+   → client NEVER sends an amount — only product IDs and quantities
+
+3. Look for an existing pending order for this user:
+   Order::where('user_id', $user->id)->where('status', 'pending')->first()
+
+4a. Pending order exists:
+    → retrieve the existing PaymentIntent from Stripe
+    → if intent status is NOT 'canceled' or 'succeeded' (still open):
+        → if amount changed: update the PaymentIntent amount on Stripe
+        → update order amount in DB
+        → return the existing client_secret  ← no new Order row created
+    → if intent was cancelled:
+        → create a new PaymentIntent
+        → update the order with new intent IDs
+        → save audit record in payment_intents table
+
+4b. No pending order:
+    → create new Order (with user_id, amount, currency='usd', status='pending')
+    → create new Stripe PaymentIntent with metadata: { order_id }
+    → save intent IDs on order
+    → save audit record in payment_intents table
+
+5. Return:
+   { id, client_secret, amount, currency, status }
+   (same shape as Stripe's own API — Flutter's PaymentIntent.fromMap works unchanged)
+```
+
+**Why server-side total calculation matters:**
+
+If the client sent the total, a malicious user could send `amount: 1` for a $50 cart. By loading prices from the DB and calculating the total on the server, the client has zero control over what they pay.
+
+**Why reuse the PaymentIntent?**
+
+Stripe PaymentIntents stay alive with status `requires_payment_method` when cancelled by the user. They can be retried with the same `client_secret`. Reusing them means:
+- One order row per checkout session (clean DB)
+- If the amount changed (user adjusted cart), Stripe allows updating the amount on an open intent
+- A fresh intent is only created when the old one is truly gone (cancelled or succeeded)
 
 ### `payment_intents` table
 
@@ -130,7 +315,7 @@ Laravel models are PHP classes that represent a database table. Each model provi
 
 ```php
 protected $fillable = [
-    'amount', 'currency', 'status',
+    'user_id', 'amount', 'currency', 'status',
     'stripe_payment_intent_id', 'stripe_client_secret',
 ];
 ```
@@ -158,20 +343,29 @@ Laravel 11 does not create `routes/api.php` by default — it was created manual
 )
 ```
 
-The two routes:
+The full route table:
 
 ```php
-Route::post('/create-payment', [PaymentController::class, 'createPayment']);
-Route::post('/webhooks/stripe', [PaymentController::class, 'stripeWebhook']);
+// Public routes (no token needed)
+Route::post('/auth/register',        [AuthController::class, 'register']);
+Route::post('/auth/login',           [AuthController::class, 'login']);
+Route::post('/webhooks/stripe',      [PaymentController::class, 'stripeWebhook']);
+Route::post('/create-payment',       [PaymentController::class, 'createPayment']);
+
+// Protected routes (Sanctum token required)
+Route::middleware('auth:sanctum')->group(function () {
+    Route::post('/auth/logout',      [AuthController::class, 'logout']);
+    Route::get('/products',          [ProductController::class, 'index']);
+    Route::post('/orders/checkout',  [OrderController::class, 'checkout']);
+});
 ```
 
-Both are `POST` because:
-- `create-payment` receives data from the app and creates a resource
-- `webhooks/stripe` receives events from Stripe
+All routes in `routes/api.php` are automatically prefixed with `/api`, so the full URLs are e.g.:
+- `POST http://your-server:8000/api/auth/login`
+- `GET  http://your-server:8000/api/products`
+- `POST http://your-server:8000/api/orders/checkout`
 
-All routes in `routes/api.php` are automatically prefixed with `/api`, so the full URLs are:
-- `POST http://your-server:8000/api/create-payment`
-- `POST http://your-server:8000/api/webhooks/stripe`
+`/api/webhooks/stripe` and `/api/create-payment` remain public — the webhook is verified by its Stripe signature (not a user token), and `create-payment` is the legacy Quick Pay endpoint kept for backwards compatibility.
 
 ---
 
@@ -433,18 +627,163 @@ The app and server each get their own confirmation independently:
 tstripe-backend/
 ├── app/
 │   ├── Http/Controllers/
-│   │   └── PaymentController.php     ← createPayment + stripeWebhook
+│   │   ├── AuthController.php        ← register, login, logout (Sanctum)
+│   │   ├── PaymentController.php     ← createPayment + stripeWebhook
+│   │   ├── ProductController.php     ← index (returns all products)
+│   │   └── OrderController.php       ← checkout (idempotent cart checkout)
 │   └── Models/
-│       ├── Order.php                 ← orders table model
-│       └── PaymentIntent.php         ← payment_intents table model
+│       ├── User.php                  ← HasApiTokens added for Sanctum
+│       ├── Product.php               ← products table model
+│       ├── Order.php                 ← orders table model (with user_id)
+│       └── PaymentIntent.php         ← payment_intents table model (audit log)
 ├── bootstrap/
 │   └── app.php                       ← registers routes/api.php
 ├── config/
 │   └── cors.php                      ← allows cross-origin requests from Flutter web
-├── database/migrations/
-│   ├── ..._create_orders_table.php
-│   └── ..._create_payment_intents_table.php
+├── database/
+│   ├── migrations/
+│   │   ├── ..._create_orders_table.php
+│   │   ├── ..._create_payment_intents_table.php
+│   │   ├── ..._create_products_table.php
+│   │   └── ..._add_user_id_to_orders_table.php
+│   └── seeders/
+│       └── ProductSeeder.php         ← 15 sample products
 ├── routes/
-│   └── api.php                       ← POST /api/create-payment, POST /api/webhooks/stripe
+│   └── api.php                       ← all API routes (public + Sanctum-protected)
 └── .env                              ← DB credentials, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
 ```
+
+---
+
+## 15. How does Stripe know where to send the webhook?
+
+Stripe doesn't know automatically — you have to tell it. There are two ways depending on whether you are in development or production.
+
+### Development — Stripe CLI
+
+When you run:
+```bash
+stripe listen --forward-to http://192.168.100.93:8000/api/webhooks/stripe
+```
+
+The CLI connects to Stripe's servers and registers your local URL **temporarily** for that session. Stripe sends all test events through the CLI tunnel to your machine. When you kill the CLI, Stripe stops sending.
+
+### Production — Stripe Dashboard
+
+You register your public URL once manually:
+```
+Stripe Dashboard
+  → Developers
+    → Webhooks
+      → Add endpoint
+        → URL: https://your-server.com/api/webhooks/stripe
+        → Select events: payment_intent.succeeded, payment_intent.payment_failed
+```
+
+Stripe saves that URL permanently and sends matching events directly to your server — no CLI needed.
+
+| | Development | Production |
+|---|---|---|
+| How Stripe knows the URL | `stripe listen` registers it temporarily | You register it permanently in Dashboard |
+| Who forwards the event | Stripe CLI (tunnel) | Stripe directly |
+| Stays registered | Only while CLI is running | Permanently |
+| Webhook secret | Printed by CLI each run | Copied once from Dashboard |
+
+---
+
+## 16. How does Stripe know to send the webhook to YOUR server and not someone else's?
+
+This is tied entirely to the **secret key**.
+
+When your server calls Stripe with `sk_test_...`, Stripe identifies which Stripe account that key belongs to. The PaymentIntent is created **inside your account** — not in any global pool.
+
+```
+Your sk_test_ key  →  identifies your Stripe account  →  PaymentIntent stored there
+```
+
+When that PaymentIntent is paid, Stripe fires the webhook to the webhook URLs registered on **your account only**:
+
+```
+Your Stripe account
+  ├── has your PaymentIntent (pi_xxx)
+  ├── has your webhook URL registered
+  └── when pi_xxx succeeds → fires webhook to YOUR URL only
+```
+
+If somebody else has a different Stripe account — their payments go to their webhooks, yours go to yours. The accounts are completely separate. Nobody else sees your events.
+
+This is also why the secret key must never leave your server. Whoever has your `sk_test_` key can create PaymentIntents that bill YOUR account and receive YOUR webhooks.
+
+### The role of `metadata`
+
+When Laravel creates the PaymentIntent, it attaches your order ID:
+
+```php
+$stripe->paymentIntents->create([
+    'amount'   => $order->amount,
+    'currency' => $order->currency,
+    'metadata' => ['order_id' => $order->id],  // ← stored on Stripe's side
+]);
+```
+
+Stripe stores this metadata with the PaymentIntent. When the webhook fires, Stripe sends the full PaymentIntent back — including your metadata. This is how your server knows which order to mark as paid:
+
+```
+Webhook arrives:
+{
+  "type": "payment_intent.succeeded",
+  "data": {
+    "id": "pi_xxx",
+    "metadata": { "order_id": "5" }   ← your data comes back
+  }
+}
+
+→ find Order #5 in DB → update status to 'paid'
+```
+
+---
+
+## 17. What is `STRIPE_WEBHOOK_SECRET` for?
+
+Your webhook endpoint `POST /api/webhooks/stripe` is a public URL. Anyone on the internet can send a POST request to it — including attackers trying to fake a payment event.
+
+**Without verification:**
+```
+Attacker sends:
+POST /api/webhooks/stripe
+{ "type": "payment_intent.succeeded", "data": { "metadata": { "order_id": "5" } } }
+
+→ Server marks order 5 as paid
+→ Attacker gets the product for free, without paying anything
+```
+
+**`STRIPE_WEBHOOK_SECRET` prevents this.**
+
+When Stripe sends a real webhook, it computes an HMAC signature over the request body using your `STRIPE_WEBHOOK_SECRET` and attaches it as a header:
+
+```
+Stripe-Signature: t=1234567890,v1=abc123xyz...
+```
+
+Your server verifies it:
+```php
+Webhook::constructEvent($payload, $sigHeader, env('STRIPE_WEBHOOK_SECRET'));
+```
+
+This asks: *"Was this request signed with our shared secret?"*
+
+```
+Real Stripe request  →  signature matches  →  process the event
+Fake request         →  signature wrong/missing  →  return 400, ignore it
+```
+
+Only Stripe knows your `STRIPE_WEBHOOK_SECRET` — so only Stripe can produce a valid signature. An attacker can copy the JSON body but cannot fake the signature without the secret.
+
+### The two keys and what they each prove
+
+| Key | Direction | Proves |
+|---|---|---|
+| `STRIPE_SECRET_KEY` | Your server → Stripe | That YOU are making a request to Stripe |
+| `STRIPE_WEBHOOK_SECRET` | Stripe → Your server | That STRIPE is making a request to you |
+
+They solve opposite directions of trust. Together they make the communication between your server and Stripe completely verified in both directions.
