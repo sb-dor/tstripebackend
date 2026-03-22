@@ -626,6 +626,8 @@ The app and server each get their own confirmation independently:
 ```
 tstripe-backend/
 ├── app/
+│   ├── Console/Commands/
+│   │   └── ReconcileStripePayments.php  ← safety net: sync missed webhook events from Stripe
 │   ├── Http/Controllers/
 │   │   ├── AuthController.php        ← register, login, logout (Sanctum)
 │   │   ├── PaymentController.php     ← createPayment + stripeWebhook
@@ -649,7 +651,8 @@ tstripe-backend/
 │   └── seeders/
 │       └── ProductSeeder.php         ← 15 sample products
 ├── routes/
-│   └── api.php                       ← all API routes (public + Sanctum-protected)
+│   ├── api.php                       ← all API routes (public + Sanctum-protected)
+│   └── console.php                   ← scheduled commands (stripe:reconcile hourly)
 └── .env                              ← DB credentials, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
 ```
 
@@ -787,3 +790,88 @@ Only Stripe knows your `STRIPE_WEBHOOK_SECRET` — so only Stripe can produce a 
 | `STRIPE_WEBHOOK_SECRET` | Stripe → Your server | That STRIPE is making a request to you |
 
 They solve opposite directions of trust. Together they make the communication between your server and Stripe completely verified in both directions.
+
+---
+
+## 18. What if the server is down when a payment succeeds?
+
+This is one of the most important edge cases in any payment system.
+
+**The scenario:**
+```
+1. Client gets a PaymentIntent client_secret from your server   ✓
+2. Your server crashes / goes down
+3. Client completes payment — Stripe processes it successfully   ✓
+4. Stripe fires: payment_intent.succeeded → but your server is down
+5. Webhook delivery fails
+6. Order stays 'pending' in DB forever                          ✗
+```
+
+### Layer 1 — Stripe automatically retries webhooks
+
+Stripe does not give up after one failed delivery. It retries the webhook with exponential backoff for **up to 72 hours**. If your server comes back online within that window, the event will arrive and the order will be updated automatically — no manual action needed.
+
+```
+Server down for 30 minutes → Stripe retries → server back → webhook arrives → order marked paid ✓
+```
+
+### Layer 2 — Reconciliation command (safety net)
+
+If your server was down longer than 72 hours, or you want to recover immediately after a restart without waiting for the next retry, use the reconciliation command:
+
+```bash
+php artisan stripe:reconcile
+```
+
+This command (`app/Console/Commands/ReconcileStripePayments.php`) queries the **Stripe Events API** directly for all `payment_intent.succeeded` and `payment_intent.payment_failed` events from the last 72 hours and updates any orders that are still `pending`:
+
+```
+Stripe Events API  →  list all succeeded/failed events since N hours ago
+                   →  for each event: find order via metadata.order_id
+                   →  if order is still 'pending' → update to 'paid' or 'failed'
+```
+
+Options:
+```bash
+php artisan stripe:reconcile              # default: last 72 hours
+php artisan stripe:reconcile --hours=1   # last 1 hour only
+php artisan stripe:reconcile --hours=168 # last 7 days
+```
+
+The command is **idempotent** — orders already marked `paid` are skipped, so running it multiple times is safe.
+
+### Layer 3 — Hourly scheduler
+
+The reconciliation command is also scheduled to run **every hour automatically** (configured in `routes/console.php`):
+
+```php
+Schedule::command(ReconcileStripePayments::class, ['--hours' => 72])
+    ->hourly()
+    ->withoutOverlapping()
+    ->runInBackground();
+```
+
+To activate the scheduler in production, add one cron entry to your server:
+```bash
+* * * * * cd /path-to-project && php artisan schedule:run >> /dev/null 2>&1
+```
+
+To run it locally for testing:
+```bash
+php artisan schedule:work   # keeps scheduler running, fires commands on their intervals
+php artisan schedule:run    # fires any commands due right now (one-shot)
+```
+
+### The complete safety net
+
+| Layer | Mechanism | Window |
+|---|---|---|
+| 1 | Stripe webhook retries | Up to 72 hours automatically |
+| 2 | `stripe:reconcile` on deploy | Run manually after recovery |
+| 3 | Hourly scheduler | Ongoing background safety net |
+
+### Why not just trust the client?
+
+When `presentPaymentSheet()` succeeds in Flutter, the app knows the payment went through. Why not just have the app call `POST /api/orders/confirm`?
+
+Because anyone can send that POST request without paying. The Stripe Events API and webhook signature are the only tamper-proof sources of truth for whether money actually moved. The client confirmation is useful for UX (showing a success screen) but must never be used to mark an order as paid on the server.
